@@ -4,7 +4,11 @@ from django.contrib import admin
 from django.contrib.auth import authenticate
 from django.core.management import call_command
 from django.test import TestCase
+from django.utils.dateparse import parse_datetime
 from django.urls import reverse
+from rest_framework import status
+from rest_framework.test import APIClient
+from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 
 from .admin import CustomUserAdmin
 from .models import CustomUser
@@ -96,4 +100,79 @@ class CustomUserTests(TestCase):
         self.assertEqual(
             CustomUserAdmin.add_form.base_fields.keys(),
             {"email", "username", "password1", "password2"},
+        )
+
+
+class JWTApiTests(TestCase):
+    def setUp(self):
+        self.user = CustomUser.objects.create_user(
+            email="jwt-user@example.com",
+            username="jwt-user",
+            password="secure-test-password",
+            role=CustomUser.Role.USER,
+        )
+        self.client = APIClient()
+
+    def test_login_returns_user_details_and_tokens(self):
+        response = self.client.post(
+            reverse("token_obtain_pair"),
+            {"email": self.user.email, "password": "secure-test-password"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("access", response.data)
+        self.assertIn("refresh", response.data)
+        self.assertEqual(
+            {
+                key: response.data[key]
+                for key in ("id", "email", "username", "role")
+            },
+            {
+                "id": self.user.pk,
+                "email": self.user.email,
+                "username": self.user.username,
+                "role": self.user.role,
+            },
+        )
+        access = AccessToken(response.data["access"])
+        refresh = RefreshToken(response.data["refresh"])
+        self.assertEqual(access["exp"] - access["iat"], 15 * 60)
+        self.assertEqual(refresh["exp"] - refresh["iat"], 7 * 24 * 60 * 60)
+
+    def test_logout_blacklists_refresh_token(self):
+        refresh = RefreshToken.for_user(self.user)
+        self.client.force_authenticate(user=self.user)
+
+        logout_response = self.client.post(
+            reverse("logout"),
+            {"refresh": str(refresh)},
+            format="json",
+        )
+
+        self.assertEqual(logout_response.status_code, status.HTTP_200_OK)
+        refresh_response = self.client.post(
+            reverse("token_refresh"),
+            {"refresh": str(refresh)},
+            format="json",
+        )
+        self.assertEqual(refresh_response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_profile_stats_requires_authentication_and_returns_user_stats(self):
+        url = reverse("profile_stats")
+        self.assertEqual(
+            self.client.get(url).status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+        self.client.force_authenticate(user=self.user)
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["email"], self.user.email)
+        self.assertEqual(response.data["role"], self.user.role)
+        self.assertFalse(response.data["is_staff"])
+        self.assertEqual(
+            parse_datetime(response.data["date_joined"]),
+            self.user.date_joined,
         )
